@@ -19,13 +19,15 @@ package org.apache.kafka.streams.kstream;
 import org.junit.Test;
 
 import static java.time.Duration.ofMillis;
+import static java.time.Duration.ofSeconds;
 import static org.apache.kafka.streams.EqualityCheck.verifyEquality;
 import static org.apache.kafka.streams.EqualityCheck.verifyInEquality;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.equalTo;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.fail;
 
-@SuppressWarnings("deprecation")
 public class JoinWindowsTest {
 
     private static final long ANY_SIZE = 123L;
@@ -44,6 +46,24 @@ public class JoinWindowsTest {
                    .after(ofMillis(0))                           // [ -anyOtherSize ; 0 ]
                    .after(ofMillis(-ANY_SIZE))                    // [ -anyOtherSize ; -anySize ]
                    .after(ofMillis(-ANY_OTHER_SIZE));              // [ -anyOtherSize ; -anyOtherSize ]
+    }
+
+    @Test
+    public void beforeShouldNotModifyGrace() {
+        final JoinWindows joinWindows = JoinWindows.of(ofMillis(ANY_SIZE))
+            .grace(ofMillis(ANY_OTHER_SIZE))
+            .before(ofSeconds(ANY_SIZE));
+
+        assertThat(joinWindows.gracePeriodMs(), equalTo(ANY_OTHER_SIZE));
+    }
+
+    @Test
+    public void afterShouldNotModifyGrace() {
+        final JoinWindows joinWindows = JoinWindows.of(ofMillis(ANY_SIZE))
+            .grace(ofMillis(ANY_OTHER_SIZE))
+            .after(ofSeconds(ANY_SIZE));
+
+        assertThat(joinWindows.gracePeriodMs(), equalTo(ANY_OTHER_SIZE));
     }
 
     @Test
@@ -78,19 +98,6 @@ public class JoinWindowsTest {
         final JoinWindows windowSpec = JoinWindows.of(ofMillis(ANY_SIZE));
         final long windowSize = windowSpec.size();
         assertEquals(windowSize, windowSpec.grace(ofMillis(windowSize)).gracePeriodMs());
-    }
-
-    @Deprecated
-    @Test
-    public void retentionTimeMustNoBeSmallerThanWindowSize() {
-        final JoinWindows windowSpec = JoinWindows.of(ofMillis(ANY_SIZE));
-        final long windowSize = windowSpec.size();
-        try {
-            windowSpec.until(windowSize - 1);
-            fail("should not accept retention time smaller than window size");
-        } catch (final IllegalArgumentException e) {
-            // expected
-        }
     }
 
     @Test

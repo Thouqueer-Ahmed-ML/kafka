@@ -17,9 +17,11 @@
 package org.apache.kafka.connect.mirror.integration;
 
 import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.admin.AdminClientConfig;
 import org.apache.kafka.clients.admin.Config;
 import org.apache.kafka.clients.admin.DescribeConfigsResult;
 import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.config.ConfigResource;
@@ -32,6 +34,7 @@ import org.apache.kafka.connect.mirror.MirrorHeartbeatConnector;
 import org.apache.kafka.connect.mirror.MirrorMakerConfig;
 import org.apache.kafka.connect.mirror.MirrorSourceConnector;
 import org.apache.kafka.connect.mirror.SourceAndTarget;
+import org.apache.kafka.connect.mirror.Checkpoint;
 import org.apache.kafka.connect.mirror.MirrorCheckpointConnector;
 import org.apache.kafka.connect.util.clusters.EmbeddedConnectCluster;
 import org.apache.kafka.connect.util.clusters.EmbeddedKafkaCluster;
@@ -56,6 +59,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import org.junit.jupiter.api.Test;
@@ -83,7 +87,8 @@ public abstract class MirrorConnectorsIntegrationBaseTest {
     private static final int CHECKPOINT_DURATION_MS = 20_000;
     private static final int RECORD_CONSUME_DURATION_MS = 20_000;
     private static final int OFFSET_SYNC_DURATION_MS = 30_000;
-    private static final int TOPIC_SYNC_DURATION_MS = 30_000;
+    private static final int TOPIC_SYNC_DURATION_MS = 60_000;
+    private static final int REQUEST_TIMEOUT_DURATION_MS = 60_000;
     private static final int NUM_WORKERS = 3;
     private static final Duration CONSUMER_POLL_TIMEOUT_MS = Duration.ofMillis(500);
     protected static final String PRIMARY_CLUSTER_ALIAS = "primary";
@@ -165,10 +170,18 @@ public abstract class MirrorConnectorsIntegrationBaseTest {
         primary.start();
         primary.assertions().assertAtLeastNumWorkersAreUp(NUM_WORKERS,
                 "Workers of " + PRIMARY_CLUSTER_ALIAS + "-connect-cluster did not start in time.");
+
+        waitForTopicCreated(primary, "mm2-status.backup.internal");
+        waitForTopicCreated(primary, "mm2-offsets.backup.internal");
+        waitForTopicCreated(primary, "mm2-configs.backup.internal");
         
         backup.start();
         backup.assertions().assertAtLeastNumWorkersAreUp(NUM_WORKERS,
                 "Workers of " + BACKUP_CLUSTER_ALIAS + "-connect-cluster did not start in time.");
+
+        waitForTopicCreated(backup, "mm2-status.primary.internal");
+        waitForTopicCreated(backup, "mm2-offsets.primary.internal");
+        waitForTopicCreated(backup, "mm2-configs.primary.internal");
 
         createTopics();
  
@@ -233,6 +246,7 @@ public abstract class MirrorConnectorsIntegrationBaseTest {
         // make sure the topic is auto-created in the other cluster
         waitForTopicCreated(primary, "backup.test-topic-1");
         waitForTopicCreated(backup, "primary.test-topic-1");
+        waitForTopicCreated(primary, "mm2-offset-syncs.backup.internal");
         assertEquals(TopicConfig.CLEANUP_POLICY_COMPACT, getTopicConfig(backup.kafka(), "primary.test-topic-1", TopicConfig.CLEANUP_POLICY_CONFIG),
                 "topic config was not synced");
         
@@ -451,7 +465,45 @@ public abstract class MirrorConnectorsIntegrationBaseTest {
         assertEquals(0, records.count(), "consumer record size is not zero");
         backupConsumer.close();
     }
-    
+
+    @Test
+    public void testOffsetSyncsTopicsOnTarget() throws Exception {
+        // move offset-syncs topics to target
+        mm2Props.put(PRIMARY_CLUSTER_ALIAS + "->" + BACKUP_CLUSTER_ALIAS + ".offset-syncs.topic.location", "target");
+        // one way replication from primary to backup
+        mm2Props.put(BACKUP_CLUSTER_ALIAS + "->" + PRIMARY_CLUSTER_ALIAS + ".enabled", "false");
+
+        mm2Config = new MirrorMakerConfig(mm2Props);
+
+        waitUntilMirrorMakerIsRunning(backup, CONNECTOR_LIST, mm2Config, PRIMARY_CLUSTER_ALIAS, BACKUP_CLUSTER_ALIAS);
+
+        // Ensure the offset syncs topic is created in the target cluster
+        waitForTopicCreated(backup.kafka(), "mm2-offset-syncs." + PRIMARY_CLUSTER_ALIAS + ".internal");
+
+        produceMessages(primary, "test-topic-1");
+
+        // Check offsets are pushed to the checkpoint topic
+        Consumer<byte[], byte[]> backupConsumer = backup.kafka().createConsumerAndSubscribeTo(Collections.singletonMap(
+                "auto.offset.reset", "earliest"), PRIMARY_CLUSTER_ALIAS + ".checkpoints.internal");
+        waitForCondition(() -> {
+            ConsumerRecords<byte[], byte[]> records = backupConsumer.poll(Duration.ofSeconds(1L));
+            for (ConsumerRecord<byte[], byte[]> record : records) {
+                Checkpoint checkpoint = Checkpoint.deserializeRecord(record);
+                if ((PRIMARY_CLUSTER_ALIAS + ".test-topic-1").equals(checkpoint.topicPartition().topic())) {
+                    return true;
+                }
+            }
+            return false;
+        }, 30_000,
+            "Unable to find checkpoints for " + PRIMARY_CLUSTER_ALIAS + "test-topic-1"
+        );
+
+        // Ensure no offset-syncs topics have been created on the primary cluster
+        Set<String> primaryTopics = primary.kafka().createAdminClient().listTopics().names().get();
+        assertFalse(primaryTopics.contains("mm2-offset-syncs." + PRIMARY_CLUSTER_ALIAS + ".internal"));
+        assertFalse(primaryTopics.contains("mm2-offset-syncs." + BACKUP_CLUSTER_ALIAS + ".internal"));
+    }
+
     /*
      * launch the connectors on kafka connect cluster and check if they are running
      */
@@ -602,13 +654,19 @@ public abstract class MirrorConnectorsIntegrationBaseTest {
     private void createTopics() {
         // to verify topic config will be sync-ed across clusters
         Map<String, String> topicConfig = Collections.singletonMap(TopicConfig.CLEANUP_POLICY_CONFIG, TopicConfig.CLEANUP_POLICY_COMPACT);
+        Map<String, String> emptyMap = Collections.emptyMap();
+
+        // increase admin client request timeout value to make the tests reliable.
+        Properties adminClientConfig = new Properties();
+        adminClientConfig.put(AdminClientConfig.REQUEST_TIMEOUT_MS_CONFIG, REQUEST_TIMEOUT_DURATION_MS);
+
         // create these topics before starting the connectors so we don't need to wait for discovery
-        primary.kafka().createTopic("test-topic-1", NUM_PARTITIONS, 1, topicConfig);
-        primary.kafka().createTopic("backup.test-topic-1", 1);
-        primary.kafka().createTopic("heartbeats", 1);
-        backup.kafka().createTopic("test-topic-1", NUM_PARTITIONS);
-        backup.kafka().createTopic("primary.test-topic-1", 1);
-        backup.kafka().createTopic("heartbeats", 1);
+        primary.kafka().createTopic("test-topic-1", NUM_PARTITIONS, 1, topicConfig, adminClientConfig);
+        primary.kafka().createTopic("backup.test-topic-1", 1, 1, emptyMap, adminClientConfig);
+        primary.kafka().createTopic("heartbeats", 1, 1, emptyMap, adminClientConfig);
+        backup.kafka().createTopic("test-topic-1", NUM_PARTITIONS, 1, emptyMap, adminClientConfig);
+        backup.kafka().createTopic("primary.test-topic-1", 1, 1, emptyMap, adminClientConfig);
+        backup.kafka().createTopic("heartbeats", 1, 1, emptyMap, adminClientConfig);
     }
 
     /*
@@ -623,5 +681,19 @@ public abstract class MirrorConnectorsIntegrationBaseTest {
         dummyConsumer.poll(CONSUMER_POLL_TIMEOUT_MS);
         dummyConsumer.commitSync();
         dummyConsumer.close();
+    }
+
+    /*
+     * wait for the topic created on the cluster
+     */
+    private static void waitForTopicCreated(EmbeddedKafkaCluster cluster, String topicName) throws InterruptedException {
+        try (final Admin adminClient = cluster.createAdminClient()) {
+            waitForCondition(() -> {
+                Set<String> topics = adminClient.listTopics().names().get();
+                return topics.contains(topicName);
+            }, OFFSET_SYNC_DURATION_MS,
+                "Topic: " + topicName + " didn't get created in the cluster"
+            );
+        }
     }
 }

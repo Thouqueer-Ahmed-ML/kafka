@@ -396,7 +396,7 @@ public abstract class AbstractCoordinator implements Closeable {
      * If this function returns false, the state can be in one of the following:
      *  * UNJOINED: got error response but times out before being able to re-join, heartbeat disabled
      *  * PREPARING_REBALANCE: not yet received join-group response before timeout, heartbeat disabled
-     *  * COMPLETING_REBALANCE: not yet received sync-group response before timeout, hearbeat enabled
+     *  * COMPLETING_REBALANCE: not yet received sync-group response before timeout, heartbeat enabled
      *
      * Visible for testing.
      *
@@ -1023,6 +1023,10 @@ public abstract class AbstractCoordinator implements Closeable {
     }
 
     /**
+     * Sends LeaveGroupRequest and logs the {@code leaveReason}, unless this member is using static membership or is already
+     * not part of the group (ie does not have a valid member id, is in the UNJOINED state, or the coordinator is unknown).
+     *
+     * @param leaveReason the reason to leave the group for logging
      * @throws KafkaException if the rebalance callback throws exception
      */
     public synchronized RequestFuture<Void> maybeLeaveGroup(String leaveReason) {
@@ -1115,12 +1119,14 @@ public abstract class AbstractCoordinator implements Closeable {
             } else if (error == Errors.REBALANCE_IN_PROGRESS) {
                 // since we may be sending the request during rebalance, we should check
                 // this case and ignore the REBALANCE_IN_PROGRESS error
-                if (state == MemberState.STABLE) {
-                    requestRejoin("group is already rebalancing");
-                    future.raise(error);
-                } else {
-                    log.debug("Ignoring heartbeat response with error {} during {} state", error, state);
-                    future.complete(null);
+                synchronized (AbstractCoordinator.this) {
+                    if (state == MemberState.STABLE) {
+                        requestRejoin("group is already rebalancing");
+                        future.raise(error);
+                    } else {
+                        log.debug("Ignoring heartbeat response with error {} during {} state", error, state);
+                        future.complete(null);
+                    }
                 }
             } else if (error == Errors.ILLEGAL_GENERATION ||
                        error == Errors.UNKNOWN_MEMBER_ID ||
@@ -1381,12 +1387,13 @@ public abstract class AbstractCoordinator implements Closeable {
                         } else if (heartbeat.pollTimeoutExpired(now)) {
                             // the poll timeout has expired, which means that the foreground thread has stalled
                             // in between calls to poll().
-                            String leaveReason = "consumer poll timeout has expired. This means the time between subsequent calls to poll() " +
-                                                    "was longer than the configured max.poll.interval.ms, which typically implies that " +
-                                                    "the poll loop is spending too much time processing messages. " +
-                                                    "You can address this either by increasing max.poll.interval.ms or by reducing " +
-                                                    "the maximum size of batches returned in poll() with max.poll.records.";
-                            maybeLeaveGroup(leaveReason);
+                            log.warn("consumer poll timeout has expired. This means the time between subsequent calls to poll() " +
+                                "was longer than the configured max.poll.interval.ms, which typically implies that " +
+                                "the poll loop is spending too much time processing messages. You can address this " +
+                                "either by increasing max.poll.interval.ms or by reducing the maximum size of batches " +
+                                "returned in poll() with max.poll.records.");
+
+                            maybeLeaveGroup("consumer poll timeout has expired.");
                         } else if (!heartbeat.shouldHeartbeat(now)) {
                             // poll again after waiting for the retry backoff in case the heartbeat failed or the
                             // coordinator disconnected

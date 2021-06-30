@@ -1,6 +1,4 @@
 /*
- * Copyright (C) 2018 Joan Goyeau.
- *
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements. See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
@@ -20,6 +18,7 @@ package org.apache.kafka.streams.scala.kstream
 
 import java.time.Duration.ofSeconds
 import java.time.Instant
+import java.util.regex.Pattern
 
 import org.apache.kafka.streams.KeyValue
 import org.apache.kafka.streams.kstream.{
@@ -465,4 +464,23 @@ class KStreamTest extends TestDriver {
     val transformNode = builder.build().describe().subtopologies().asScala.head.nodes().asScala.toList(1)
     assertEquals("my-name", transformNode.name())
   }
+
+  @Test
+  def testSettingNameOnStream(): Unit = {
+    val builder = new StreamsBuilder()
+    val topicsPattern = "t-[A-Za-z0-9-].suffix"
+    val sinkTopic = "sink"
+
+    builder
+      .stream[String, String](Pattern.compile(topicsPattern))(
+        Consumed.`with`[String, String].withName("my-fancy-name")
+      )
+      .to(sinkTopic)
+
+    import scala.jdk.CollectionConverters._
+
+    val streamNode = builder.build().describe().subtopologies().asScala.head.nodes().asScala.head
+    assertEquals("my-fancy-name", streamNode.name())
+  }
+
 }

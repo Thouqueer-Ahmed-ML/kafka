@@ -18,7 +18,6 @@
 package org.apache.kafka.clients.admin;
 
 import org.apache.kafka.clients.ApiVersions;
-import org.apache.kafka.clients.ClientDnsLookup;
 import org.apache.kafka.clients.ClientRequest;
 import org.apache.kafka.clients.ClientResponse;
 import org.apache.kafka.clients.ClientUtils;
@@ -32,11 +31,17 @@ import org.apache.kafka.clients.admin.DeleteAclsResult.FilterResults;
 import org.apache.kafka.clients.admin.DescribeReplicaLogDirsResult.ReplicaLogDirInfo;
 import org.apache.kafka.clients.admin.ListOffsetsResult.ListOffsetsResultInfo;
 import org.apache.kafka.clients.admin.OffsetSpec.TimestampSpec;
-import org.apache.kafka.clients.admin.internals.AdminApiHandler;
-import org.apache.kafka.clients.admin.internals.AdminMetadataManager;
+import org.apache.kafka.clients.admin.internals.AbortTransactionHandler;
 import org.apache.kafka.clients.admin.internals.AdminApiDriver;
+import org.apache.kafka.clients.admin.internals.AdminApiHandler;
+import org.apache.kafka.clients.admin.internals.AdminApiFuture;
+import org.apache.kafka.clients.admin.internals.AdminMetadataManager;
+import org.apache.kafka.clients.admin.internals.AllBrokersStrategy;
 import org.apache.kafka.clients.admin.internals.ConsumerGroupOperationContext;
+import org.apache.kafka.clients.admin.internals.CoordinatorKey;
 import org.apache.kafka.clients.admin.internals.DescribeProducersHandler;
+import org.apache.kafka.clients.admin.internals.DescribeTransactionsHandler;
+import org.apache.kafka.clients.admin.internals.ListTransactionsHandler;
 import org.apache.kafka.clients.admin.internals.MetadataOperationContext;
 import org.apache.kafka.clients.consumer.ConsumerPartitionAssignor.Assignment;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
@@ -532,7 +537,6 @@ public class KafkaAdminClient extends AdminClient {
                 (int) TimeUnit.HOURS.toMillis(1),
                 config.getLong(AdminClientConfig.SOCKET_CONNECTION_SETUP_TIMEOUT_MS_CONFIG),
                 config.getLong(AdminClientConfig.SOCKET_CONNECTION_SETUP_TIMEOUT_MAX_MS_CONFIG),
-                ClientDnsLookup.forConfig(config.getString(AdminClientConfig.CLIENT_DNS_LOOKUP_CONFIG)),
                 time,
                 true,
                 apiVersions,
@@ -4205,11 +4209,7 @@ public class KafkaAdminClient extends AdminClient {
             OffsetSpec offsetSpec = entry.getValue();
             TopicPartition tp = entry.getKey();
             KafkaFutureImpl<ListOffsetsResultInfo> future = futures.get(tp);
-            long offsetQuery = (offsetSpec instanceof TimestampSpec)
-                    ? ((TimestampSpec) offsetSpec).timestamp()
-                    : (offsetSpec instanceof OffsetSpec.EarliestSpec)
-                        ? ListOffsetsRequest.EARLIEST_TIMESTAMP
-                        : ListOffsetsRequest.LATEST_TIMESTAMP;
+            long offsetQuery = getOffsetFromOffsetSpec(offsetSpec);
             // avoid sending listOffsets request for topics with errors
             if (!mr.errors().containsKey(tp.topic())) {
                 Node node = mr.cluster().leaderFor(tp);
@@ -4232,10 +4232,12 @@ public class KafkaAdminClient extends AdminClient {
 
                 final List<ListOffsetsTopic> partitionsToQuery = new ArrayList<>(entry.getValue().values());
 
+                private boolean supportsMaxTimestamp = true;
+
                 @Override
                 ListOffsetsRequest.Builder createRequest(int timeoutMs) {
                     return ListOffsetsRequest.Builder
-                            .forConsumer(true, context.options().isolationLevel())
+                            .forConsumer(true, context.options().isolationLevel(), supportsMaxTimestamp)
                             .setTargetTimes(partitionsToQuery);
                 }
 
@@ -4293,6 +4295,36 @@ public class KafkaAdminClient extends AdminClient {
                             future.completeExceptionally(throwable);
                         }
                     }
+                }
+
+                @Override
+                boolean handleUnsupportedVersionException(UnsupportedVersionException exception) {
+                    if (supportsMaxTimestamp) {
+                        supportsMaxTimestamp = false;
+
+                        // fail any unsupported futures and remove partitions from the downgraded retry
+                        boolean foundMaxTimestampPartition = false;
+                        Iterator<ListOffsetsTopic> topicIterator = partitionsToQuery.iterator();
+                        while (topicIterator.hasNext()) {
+                            ListOffsetsTopic topic = topicIterator.next();
+                            Iterator<ListOffsetsPartition> partitionIterator = topic.partitions().iterator();
+                            while (partitionIterator.hasNext()) {
+                                ListOffsetsPartition partition = partitionIterator.next();
+                                if (partition.timestamp() == ListOffsetsRequest.MAX_TIMESTAMP) {
+                                    foundMaxTimestampPartition = true;
+                                    futures.get(new TopicPartition(topic.name(), partition.partitionIndex()))
+                                        .completeExceptionally(new UnsupportedVersionException(
+                                            "Broker " + brokerId + " does not support MAX_TIMESTAMP offset spec"));
+                                    partitionIterator.remove();
+                                }
+                            }
+                            if (topic.partitions().isEmpty()) {
+                                topicIterator.remove();
+                            }
+                        }
+                        return foundMaxTimestampPartition && !partitionsToQuery.isEmpty();
+                    }
+                    return false;
                 }
             });
         }
@@ -4729,16 +4761,43 @@ public class KafkaAdminClient extends AdminClient {
 
     @Override
     public DescribeProducersResult describeProducers(Collection<TopicPartition> topicPartitions, DescribeProducersOptions options) {
-        DescribeProducersHandler handler = new DescribeProducersHandler(
-            new HashSet<>(topicPartitions),
-            options,
-            logContext
-        );
-        return new DescribeProducersResult(invokeDriver(handler, options.timeoutMs));
+        AdminApiFuture.SimpleAdminApiFuture<TopicPartition, DescribeProducersResult.PartitionProducerState> future =
+            DescribeProducersHandler.newFuture(topicPartitions);
+        DescribeProducersHandler handler = new DescribeProducersHandler(options, logContext);
+        invokeDriver(handler, future, options.timeoutMs);
+        return new DescribeProducersResult(future.all());
     }
 
-    private <K, V> Map<K, KafkaFutureImpl<V>> invokeDriver(
+    @Override
+    public DescribeTransactionsResult describeTransactions(Collection<String> transactionalIds, DescribeTransactionsOptions options) {
+        AdminApiFuture.SimpleAdminApiFuture<CoordinatorKey, TransactionDescription> future =
+            DescribeTransactionsHandler.newFuture(transactionalIds);
+        DescribeTransactionsHandler handler = new DescribeTransactionsHandler(logContext);
+        invokeDriver(handler, future, options.timeoutMs);
+        return new DescribeTransactionsResult(future.all());
+    }
+
+    @Override
+    public AbortTransactionResult abortTransaction(AbortTransactionSpec spec, AbortTransactionOptions options) {
+        AdminApiFuture.SimpleAdminApiFuture<TopicPartition, Void> future =
+            AbortTransactionHandler.newFuture(Collections.singleton(spec.topicPartition()));
+        AbortTransactionHandler handler = new AbortTransactionHandler(spec, logContext);
+        invokeDriver(handler, future, options.timeoutMs);
+        return new AbortTransactionResult(future.all());
+    }
+
+    @Override
+    public ListTransactionsResult listTransactions(ListTransactionsOptions options) {
+        AllBrokersStrategy.AllBrokersFuture<Collection<TransactionListing>> future =
+            ListTransactionsHandler.newFuture();
+        ListTransactionsHandler handler = new ListTransactionsHandler(options, logContext);
+        invokeDriver(handler, future, options.timeoutMs);
+        return new ListTransactionsResult(future.all());
+    }
+
+    private <K, V> void invokeDriver(
         AdminApiHandler<K, V> handler,
+        AdminApiFuture<K, V> future,
         Integer timeoutMs
     ) {
         long currentTimeMs = time.milliseconds();
@@ -4746,13 +4805,13 @@ public class KafkaAdminClient extends AdminClient {
 
         AdminApiDriver<K, V> driver = new AdminApiDriver<>(
             handler,
+            future,
             deadlineMs,
             retryBackoffMs,
             logContext
         );
 
         maybeSendRequests(driver, currentTimeMs);
-        return driver.futures();
     }
 
     private <K, V> void maybeSendRequests(AdminApiDriver<K, V> driver, long currentTimeMs) {
@@ -4801,6 +4860,17 @@ public class KafkaAdminClient extends AdminClient {
                 }
             }
         };
+    }
+
+    private long getOffsetFromOffsetSpec(OffsetSpec offsetSpec) {
+        if (offsetSpec instanceof TimestampSpec) {
+            return ((TimestampSpec) offsetSpec).timestamp();
+        } else if (offsetSpec instanceof OffsetSpec.EarliestSpec) {
+            return ListOffsetsRequest.EARLIEST_TIMESTAMP;
+        } else if (offsetSpec instanceof OffsetSpec.MaxTimestampSpec) {
+            return ListOffsetsRequest.MAX_TIMESTAMP;
+        }
+        return ListOffsetsRequest.LATEST_TIMESTAMP;
     }
 
     /**
