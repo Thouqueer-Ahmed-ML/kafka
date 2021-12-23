@@ -305,7 +305,7 @@ public class EmbeddedKafkaCluster {
         log.info("Describing topics {}", topicNames);
         try (Admin admin = createAdminClient()) {
             DescribeTopicsResult result = admin.describeTopics(topicNames);
-            Map<String, KafkaFuture<TopicDescription>> byName = result.values();
+            Map<String, KafkaFuture<TopicDescription>> byName = result.topicNameValues();
             for (Map.Entry<String, KafkaFuture<TopicDescription>> entry : byName.entrySet()) {
                 String topicName = entry.getKey();
                 try {
@@ -371,13 +371,26 @@ public class EmbeddedKafkaCluster {
                     + brokers.length + ") for desired replication (" + replication + ")");
         }
 
-        log.debug("Creating topic { name: {}, partitions: {}, replication: {}, config: {} }",
+        log.info("Creating topic { name: {}, partitions: {}, replication: {}, config: {} }",
                 topic, partitions, replication, topicConfig);
         final NewTopic newTopic = new NewTopic(topic, partitions, (short) replication);
         newTopic.configs(topicConfig);
 
         try (final Admin adminClient = createAdminClient(adminClientConfig)) {
             adminClient.createTopics(Collections.singletonList(newTopic)).all().get();
+        } catch (final InterruptedException | ExecutionException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    /**
+     * Delete a Kafka topic.
+     *
+     * @param topic the topic to delete; may not be null
+     */
+    public void deleteTopic(String topic) {
+        try (final Admin adminClient = createAdminClient()) {
+            adminClient.deleteTopics(Collections.singleton(topic)).all().get();
         } catch (final InterruptedException | ExecutionException e) {
             throw new RuntimeException(e);
         }

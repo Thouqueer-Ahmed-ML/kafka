@@ -32,6 +32,7 @@ import org.apache.kafka.common.errors.RebalanceInProgressException;
 import org.apache.kafka.common.errors.RetriableException;
 import org.apache.kafka.common.errors.UnknownMemberIdException;
 import org.apache.kafka.common.message.FindCoordinatorRequestData;
+import org.apache.kafka.common.message.FindCoordinatorResponseData.Coordinator;
 import org.apache.kafka.common.message.HeartbeatRequestData;
 import org.apache.kafka.common.message.JoinGroupRequestData;
 import org.apache.kafka.common.message.JoinGroupResponseData;
@@ -442,7 +443,7 @@ public abstract class AbstractCoordinator implements Closeable {
                     stateSnapshot = this.state;
                 }
 
-                if (!generationSnapshot.equals(Generation.NO_GENERATION) && stateSnapshot == MemberState.STABLE) {
+                if (!hasGenerationReset(generationSnapshot) && stateSnapshot == MemberState.STABLE) {
                     // Duplicate the buffer in case `onJoinComplete` does not complete and needs to be retried.
                     ByteBuffer memberAssignment = future.value().duplicate();
 
@@ -459,13 +460,14 @@ public abstract class AbstractCoordinator implements Closeable {
                             "modified by heartbeat thread to %s/%s before the rebalance callback triggered",
                             generationSnapshot, stateSnapshot);
 
-                    resetStateAndRejoin(reason);
+                    resetStateAndRejoin(reason, true);
                     resetJoinGroupFuture();
                 }
             } else {
                 final RuntimeException exception = future.exception();
 
                 resetJoinGroupFuture();
+                rejoinNeeded = true;
 
                 if (exception instanceof UnknownMemberIdException ||
                     exception instanceof IllegalGenerationException ||
@@ -475,7 +477,6 @@ public abstract class AbstractCoordinator implements Closeable {
                 else if (!future.isRetriable())
                     throw exception;
 
-                resetStateAndRejoin(String.format("rebalance failed with retriable error %s", exception));
                 timer.sleep(rebalanceConfig.retryBackoffMs);
             }
         }
@@ -547,8 +548,12 @@ public abstract class AbstractCoordinator implements Closeable {
 
         // Note that we override the request timeout using the rebalance timeout since that is the
         // maximum time that it may block on the coordinator. We add an extra 5 seconds for small delays.
-        int joinGroupTimeoutMs = Math.max(client.defaultRequestTimeoutMs(),
-            rebalanceConfig.rebalanceTimeoutMs + JOIN_GROUP_TIMEOUT_LAPSE);
+        int joinGroupTimeoutMs = Math.max(
+            client.defaultRequestTimeoutMs(),
+            Math.max(
+                rebalanceConfig.rebalanceTimeoutMs + JOIN_GROUP_TIMEOUT_LAPSE,
+                rebalanceConfig.rebalanceTimeoutMs) // guard against overflow since rebalance timeout can be MAX_VALUE
+            );
         return client.send(coordinator, requestBuilder, joinGroupTimeoutMs)
                 .compose(new JoinGroupResponseHandler(generation));
     }
@@ -607,7 +612,7 @@ public abstract class AbstractCoordinator implements Closeable {
                 // only need to reset the member id if generation has not been changed,
                 // then retry immediately
                 if (generationUnchanged())
-                    resetGenerationOnResponseError(ApiKeys.JOIN_GROUP, error);
+                    resetStateOnResponseError(ApiKeys.JOIN_GROUP, error, true);
 
                 future.raise(error);
             } else if (error == Errors.COORDINATOR_NOT_AVAILABLE
@@ -646,12 +651,12 @@ public abstract class AbstractCoordinator implements Closeable {
                 // Broker requires a concrete member id to be allowed to join the group. Update member id
                 // and send another join group request in next cycle.
                 String memberId = joinResponse.data().memberId();
-                log.debug("JoinGroup failed due to non-fatal error: {} Will set the member id as {} and then rejoin. " +
-                              "Sent generation was  {}", error, memberId, sentGeneration);
+                log.debug("JoinGroup failed due to non-fatal error: {}. Will set the member id as {} and then rejoin. " +
+                              "Sent generation was {}", error, memberId, sentGeneration);
                 synchronized (AbstractCoordinator.this) {
                     AbstractCoordinator.this.generation = new Generation(OffsetCommitRequest.DEFAULT_GENERATION_ID, memberId, null);
                 }
-                requestRejoin("need to re-join with the given member-id");
+                requestRejoin("need to re-join with the given member-id: " + memberId);
 
                 future.raise(error);
             } else if (error == Errors.REBALANCE_IN_PROGRESS) {
@@ -679,7 +684,7 @@ public abstract class AbstractCoordinator implements Closeable {
                                 .setGenerationId(generation.generationId)
                                 .setAssignments(Collections.emptyList())
                 );
-        log.debug("Sending follower SyncGroup to coordinator {} at generation {}: {}", this.coordinator, this.generation, requestBuilder);
+        log.debug("Sending follower SyncGroup to coordinator {}: {}", this.coordinator, requestBuilder);
         return sendSyncGroupRequest(requestBuilder);
     }
 
@@ -708,7 +713,7 @@ public abstract class AbstractCoordinator implements Closeable {
                                     .setGenerationId(generation.generationId)
                                     .setAssignments(groupAssignmentList)
                     );
-            log.debug("Sending leader SyncGroup to coordinator {} at generation {}: {}", this.coordinator, this.generation, requestBuilder);
+            log.debug("Sending leader SyncGroup to coordinator {}: {}", this.coordinator, this.generation, requestBuilder);
             return sendSyncGroupRequest(requestBuilder);
         } catch (RuntimeException e) {
             return RequestFuture.failure(e);
@@ -720,6 +725,11 @@ public abstract class AbstractCoordinator implements Closeable {
             return RequestFuture.coordinatorNotAvailable();
         return client.send(coordinator, requestBuilder)
                 .compose(new SyncGroupResponseHandler(generation));
+    }
+
+    private boolean hasGenerationReset(Generation gen) {
+        // the member ID might not be reset for ILLEGAL_GENERATION error, so only check generationID and protocol name here
+        return gen.generationId == Generation.NO_GENERATION.generationId && gen.protocolName == null;
     }
 
     private class SyncGroupResponseHandler extends CoordinatorResponseHandler<SyncGroupResponse, ByteBuffer> {
@@ -741,7 +751,7 @@ public abstract class AbstractCoordinator implements Closeable {
                     sensors.syncSensor.record(response.requestLatencyMs());
 
                     synchronized (AbstractCoordinator.this) {
-                        if (!generation.equals(Generation.NO_GENERATION) && state == MemberState.COMPLETING_REBALANCE) {
+                        if (!hasGenerationReset(generation) && state == MemberState.COMPLETING_REBALANCE) {
                             // check protocol name only if the generation is not reset
                             final String protocolName = syncResponse.data().protocolName();
                             final boolean protocolNameInconsistent = protocolName != null &&
@@ -789,8 +799,10 @@ public abstract class AbstractCoordinator implements Closeable {
                         || error == Errors.ILLEGAL_GENERATION) {
                     log.info("SyncGroup failed: {} Need to re-join the group. Sent generation was {}",
                             error.message(), sentGeneration);
-                    if (generationUnchanged())
-                        resetGenerationOnResponseError(ApiKeys.SYNC_GROUP, error);
+                    if (generationUnchanged()) {
+                        // don't reset generation member ID when ILLEGAL_GENERATION, since the member ID might still be valid
+                        resetStateOnResponseError(ApiKeys.SYNC_GROUP, error, error != Errors.ILLEGAL_GENERATION);
+                    }
 
                     future.raise(error);
                 } else if (error == Errors.COORDINATOR_NOT_AVAILABLE
@@ -814,11 +826,10 @@ public abstract class AbstractCoordinator implements Closeable {
     private RequestFuture<Void> sendFindCoordinatorRequest(Node node) {
         // initiate the group metadata request
         log.debug("Sending FindCoordinator request to broker {}", node);
-        FindCoordinatorRequest.Builder requestBuilder =
-                new FindCoordinatorRequest.Builder(
-                        new FindCoordinatorRequestData()
-                            .setKeyType(CoordinatorType.GROUP.id())
-                            .setKey(this.rebalanceConfig.groupId));
+        FindCoordinatorRequestData data = new FindCoordinatorRequestData()
+                .setKeyType(CoordinatorType.GROUP.id())
+                .setKey(this.rebalanceConfig.groupId);
+        FindCoordinatorRequest.Builder requestBuilder = new FindCoordinatorRequest.Builder(data);
         return client.send(node, requestBuilder)
                 .compose(new FindCoordinatorResponseHandler());
     }
@@ -829,18 +840,23 @@ public abstract class AbstractCoordinator implements Closeable {
         public void onSuccess(ClientResponse resp, RequestFuture<Void> future) {
             log.debug("Received FindCoordinator response {}", resp);
 
-            FindCoordinatorResponse findCoordinatorResponse = (FindCoordinatorResponse) resp.responseBody();
-            Errors error = findCoordinatorResponse.error();
+            List<Coordinator> coordinators = ((FindCoordinatorResponse) resp.responseBody()).coordinators();
+            if (coordinators.size() != 1) {
+                log.error("Group coordinator lookup failed: Invalid response containing more than a single coordinator");
+                future.raise(new IllegalStateException("Group coordinator lookup failed: Invalid response containing more than a single coordinator"));
+            }
+            Coordinator coordinatorData = coordinators.get(0);
+            Errors error = Errors.forCode(coordinatorData.errorCode());
             if (error == Errors.NONE) {
                 synchronized (AbstractCoordinator.this) {
                     // use MAX_VALUE - node.id as the coordinator id to allow separate connections
                     // for the coordinator in the underlying network client layer
-                    int coordinatorConnectionId = Integer.MAX_VALUE - findCoordinatorResponse.data().nodeId();
+                    int coordinatorConnectionId = Integer.MAX_VALUE - coordinatorData.nodeId();
 
                     AbstractCoordinator.this.coordinator = new Node(
                             coordinatorConnectionId,
-                            findCoordinatorResponse.data().host(),
-                            findCoordinatorResponse.data().port());
+                            coordinatorData.host(),
+                            coordinatorData.port());
                     log.info("Discovered group coordinator {}", coordinator);
                     client.tryConnect(coordinator);
                     heartbeat.resetSessionTimeout();
@@ -849,7 +865,7 @@ public abstract class AbstractCoordinator implements Closeable {
             } else if (error == Errors.GROUP_AUTHORIZATION_FAILED) {
                 future.raise(GroupAuthorizationException.forGroupId(rebalanceConfig.groupId));
             } else {
-                log.debug("Group coordinator lookup failed: {}", findCoordinatorResponse.data().errorMessage());
+                log.debug("Group coordinator lookup failed: {}", coordinatorData.errorMessage());
                 future.raise(error);
             }
         }
@@ -916,8 +932,10 @@ public abstract class AbstractCoordinator implements Closeable {
 
             // Disconnect from the coordinator to ensure that there are no in-flight requests remaining.
             // Pending callbacks will be invoked with a DisconnectException on the next call to poll.
-            if (!isDisconnected)
+            if (!isDisconnected) {
+                log.info("Requesting disconnect from last known coordinator {}", oldCoordinator);
                 client.disconnectAsync(oldCoordinator);
+            }
 
             lastTimeOfConnectionMs = time.milliseconds();
         } else {
@@ -957,25 +975,38 @@ public abstract class AbstractCoordinator implements Closeable {
         return generation.memberId;
     }
 
-    private synchronized void resetStateAndGeneration(final String reason) {
-        log.info("Resetting generation due to: {}", reason);
+    private synchronized void resetStateAndGeneration(final String reason, final boolean shouldResetMemberId) {
+        log.info("Resetting generation {}due to: {}", shouldResetMemberId ? "and member id " : "", reason);
 
         state = MemberState.UNJOINED;
-        generation = Generation.NO_GENERATION;
+        if (shouldResetMemberId) {
+            generation = Generation.NO_GENERATION;
+        } else {
+            // keep member id since it might be still valid, to avoid to wait for the old member id leaving group
+            // until rebalance timeout in next rebalance
+            generation = new Generation(Generation.NO_GENERATION.generationId, generation.memberId, null);
+        }
     }
 
-    private synchronized void resetStateAndRejoin(final String reason) {
-        resetStateAndGeneration(reason);
+    private synchronized void resetStateAndRejoin(final String reason, final boolean shouldResetMemberId) {
+        resetStateAndGeneration(reason, shouldResetMemberId);
         requestRejoin(reason);
+        needsJoinPrepare = true;
     }
 
-    synchronized void resetGenerationOnResponseError(ApiKeys api, Errors error) {
+    synchronized void resetStateOnResponseError(ApiKeys api, Errors error, boolean shouldResetMemberId) {
         final String reason = String.format("encountered %s from %s response", error, api);
-        resetStateAndRejoin(reason);
+        resetStateAndRejoin(reason, shouldResetMemberId);
     }
 
     synchronized void resetGenerationOnLeaveGroup() {
-        resetStateAndRejoin("consumer pro-actively leaving the group");
+        resetStateAndRejoin("consumer pro-actively leaving the group", true);
+    }
+
+    public synchronized void requestRejoinIfNecessary(final String reason) {
+        if (!this.rejoinNeeded) {
+            requestRejoin(reason);
+        }
     }
 
     public synchronized void requestRejoin(final String reason) {
@@ -1134,7 +1165,8 @@ public abstract class AbstractCoordinator implements Closeable {
                 if (generationUnchanged()) {
                     log.info("Attempt to heartbeat with {} and group instance id {} failed due to {}, resetting generation",
                         sentGeneration, rebalanceConfig.groupInstanceId, error);
-                    resetGenerationOnResponseError(ApiKeys.HEARTBEAT, error);
+                    // don't reset generation member ID when ILLEGAL_GENERATION, since the member ID is still valid
+                    resetStateOnResponseError(ApiKeys.HEARTBEAT, error, error != Errors.ILLEGAL_GENERATION);
                     future.raise(error);
                 } else {
                     // if the generation has changed, then ignore this error

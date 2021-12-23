@@ -21,7 +21,6 @@ import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.apache.kafka.common.utils.Bytes;
 import org.apache.kafka.common.utils.Utils;
-import org.apache.kafka.streams.StreamsConfig.InternalConfig;
 import org.apache.kafka.streams.Topology.AutoOffsetReset;
 import org.apache.kafka.streams.errors.TopologyException;
 import org.apache.kafka.streams.kstream.Branched;
@@ -50,6 +49,7 @@ import org.apache.kafka.test.MockMapper;
 import org.apache.kafka.test.MockPredicate;
 import org.apache.kafka.test.MockProcessorSupplier;
 import org.apache.kafka.test.MockValueJoiner;
+import org.apache.kafka.test.MockApiProcessorSupplier;
 import org.apache.kafka.test.NoopValueTransformer;
 import org.apache.kafka.test.NoopValueTransformerWithKey;
 import org.apache.kafka.test.StreamsTestUtils;
@@ -708,53 +708,34 @@ public class StreamsBuilderTest {
     }
 
     @Test
-    public void shouldNotAddThirdStateStoreIfStreamStreamJoinFixIsDisabledViaConfig() {
-        shouldNotAddThirdStateStoreIfStreamStreamJoinFixIsDisabled(
-            JoinWindows.ofTimeDifferenceWithNoGrace(Duration.ofHours(1)),
-            false
-        );
-    }
-
-    @Test
     public void shouldNotAddThirdStateStoreIfStreamStreamJoinFixIsDisabledViaOldApi() {
-        shouldNotAddThirdStateStoreIfStreamStreamJoinFixIsDisabled(
-            JoinWindows.of(Duration.ofHours(1)),
-            true
-        );
-    }
-
-    private void shouldNotAddThirdStateStoreIfStreamStreamJoinFixIsDisabled(
-        final JoinWindows joinWindows,
-        final boolean enableFix
-    ) {
         final KStream<String, String> streamOne = builder.stream(STREAM_TOPIC);
         final KStream<String, String> streamTwo = builder.stream(STREAM_TOPIC_TWO);
 
         streamOne.leftJoin(
-            streamTwo,
-            (value1, value2) -> value1,
-            joinWindows,
-            StreamJoined.<String, String, String>as(STREAM_OPERATION_NAME)
-                .withName(STREAM_OPERATION_NAME)
+                streamTwo,
+                (value1, value2) -> value1,
+                JoinWindows.of(Duration.ofHours(1)),
+                StreamJoined.<String, String, String>as(STREAM_OPERATION_NAME)
+                        .withName(STREAM_OPERATION_NAME)
         );
 
         final Properties properties = new Properties();
-        properties.put(InternalConfig.ENABLE_KSTREAMS_OUTER_JOIN_SPURIOUS_RESULTS_FIX, enableFix);
         builder.build(properties);
 
         final ProcessorTopology topology = builder.internalTopologyBuilder.rewriteTopology(new StreamsConfig(props)).buildTopology();
         assertNamesForStateStore(topology.stateStores(),
-            STREAM_OPERATION_NAME + "-this-join-store",
-            STREAM_OPERATION_NAME + "-outer-other-join-store"
+                STREAM_OPERATION_NAME + "-this-join-store",
+                STREAM_OPERATION_NAME + "-outer-other-join-store"
         );
         assertNamesForOperation(topology,
-            "KSTREAM-SOURCE-0000000000",
-            "KSTREAM-SOURCE-0000000001",
-            STREAM_OPERATION_NAME + "-this-windowed",
-            STREAM_OPERATION_NAME + "-other-windowed",
-            STREAM_OPERATION_NAME + "-this-join",
-            STREAM_OPERATION_NAME + "-outer-other-join",
-            STREAM_OPERATION_NAME + "-merge");
+                "KSTREAM-SOURCE-0000000000",
+                "KSTREAM-SOURCE-0000000001",
+                STREAM_OPERATION_NAME + "-this-windowed",
+                STREAM_OPERATION_NAME + "-other-windowed",
+                STREAM_OPERATION_NAME + "-this-join",
+                STREAM_OPERATION_NAME + "-outer-other-join",
+                STREAM_OPERATION_NAME + "-merge");
     }
 
     @Test
@@ -1016,6 +997,40 @@ public class StreamsBuilderTest {
             STREAM_OPERATION_NAME + "-sink",
             STREAM_OPERATION_NAME + "-source",
             STREAM_OPERATION_NAME);
+    }
+
+    @Test
+    public void shouldUseSpecifiedNameForGlobalStoreProcessor() {
+        builder.addGlobalStore(Stores.keyValueStoreBuilder(
+                        Stores.inMemoryKeyValueStore("store"),
+                        Serdes.String(),
+                        Serdes.String()
+                ),
+                "topic",
+                Consumed.with(Serdes.String(), Serdes.String()).withName("test"),
+                new MockApiProcessorSupplier<>()
+        );
+        builder.build();
+
+        final ProcessorTopology topology = builder.internalTopologyBuilder.rewriteTopology(new StreamsConfig(props)).buildGlobalStateTopology();
+        assertNamesForOperation(topology, "test-source", "test");
+    }
+
+    @Test
+    public void shouldUseDefaultNameForGlobalStoreProcessor() {
+        builder.addGlobalStore(Stores.keyValueStoreBuilder(
+                        Stores.inMemoryKeyValueStore("store"),
+                        Serdes.String(),
+                        Serdes.String()
+                ),
+                "topic",
+                Consumed.with(Serdes.String(), Serdes.String()),
+                new MockApiProcessorSupplier<>()
+        );
+        builder.build();
+
+        final ProcessorTopology topology = builder.internalTopologyBuilder.rewriteTopology(new StreamsConfig(props)).buildGlobalStateTopology();
+        assertNamesForOperation(topology, "KSTREAM-SOURCE-0000000000", "KTABLE-SOURCE-0000000001");
     }
 
     @Test

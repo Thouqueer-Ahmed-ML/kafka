@@ -50,7 +50,7 @@ import org.apache.kafka.common._
 import org.apache.kafka.common.config.internals.QuotaConfigs
 import org.apache.kafka.server.authorizer.{Action, AuthorizableRequestContext, AuthorizationResult}
 import org.junit.jupiter.api.Assertions._
-import org.junit.jupiter.api.{AfterEach, BeforeEach, Test}
+import org.junit.jupiter.api.{AfterEach, BeforeEach, Test, TestInfo}
 
 import scala.collection.mutable.ListBuffer
 import scala.jdk.CollectionConverters._
@@ -62,7 +62,6 @@ class RequestQuotaTest extends BaseRequestTest {
   private val topic = "topic-1"
   private val numPartitions = 1
   private val tp = new TopicPartition(topic, 0)
-  private val topicIds =  Collections.singletonMap(topic, Uuid.randomUuid())
   private val logDir = "logDir"
   private val unthrottledClientId = "unthrottled-client"
   private val smallQuotaProducerClientId = "small-quota-producer-client"
@@ -86,9 +85,9 @@ class RequestQuotaTest extends BaseRequestTest {
   }
 
   @BeforeEach
-  override def setUp(): Unit = {
+  override def setUp(testInfo: TestInfo): Unit = {
     RequestQuotaTest.principal = KafkaPrincipal.ANONYMOUS
-    super.setUp()
+    super.setUp(testInfo)
 
     createTopic(topic, numPartitions)
     leaderNode = servers.head
@@ -227,8 +226,8 @@ class RequestQuotaTest extends BaseRequestTest {
 
         case ApiKeys.FETCH =>
           val partitionMap = new util.LinkedHashMap[TopicPartition, FetchRequest.PartitionData]
-          partitionMap.put(tp, new FetchRequest.PartitionData(0, 0, 100, Optional.of(15)))
-          FetchRequest.Builder.forConsumer(0, 0, partitionMap)
+          partitionMap.put(tp, new FetchRequest.PartitionData(getTopicIds().getOrElse(tp.topic, Uuid.ZERO_UUID), 0, 0, 100, Optional.of(15)))
+          FetchRequest.Builder.forConsumer(ApiKeys.FETCH.latestVersion, 0, 0, partitionMap)
 
         case ApiKeys.METADATA =>
           new MetadataRequest.Builder(List(topic).asJava, true)
@@ -255,7 +254,7 @@ class RequestQuotaTest extends BaseRequestTest {
               .setZkVersion(2)
               .setReplicas(Seq(brokerId).asJava)
               .setIsNew(true)).asJava,
-            topicIds,
+            getTopicIds().asJava,
             Set(new Node(brokerId, "localhost", 0)).asJava)
 
         case ApiKeys.STOP_REPLICA =>
@@ -327,7 +326,7 @@ class RequestQuotaTest extends BaseRequestTest {
           new FindCoordinatorRequest.Builder(
               new FindCoordinatorRequestData()
                 .setKeyType(FindCoordinatorRequest.CoordinatorType.GROUP.id)
-                .setKey("test-group"))
+                .setCoordinatorKeys(Collections.singletonList("test-group")))
 
         case ApiKeys.JOIN_GROUP =>
           new JoinGroupRequest.Builder(

@@ -126,8 +126,22 @@ ext {
 
   defaultMaxHeapSize = "2g"
   defaultJvmArgs = ["-Xss4m", "-XX:+UseParallelGC"]
-  if (JavaVersion.current() == JavaVersion.VERSION_16)  
-    defaultJvmArgs.add("--illegal-access=permit")
+  
+  // "JEP 403: Strongly Encapsulate JDK Internals" causes some tests to fail when they try
+  // to access internals (often via mocking libraries). We use `--add-opens` as a workaround
+  // for now and we'll fix it properly (where possible) via KAFKA-13275.
+  if (JavaVersion.current().isCompatibleWith(JavaVersion.VERSION_16))
+    defaultJvmArgs.addAll(
+      "--add-opens=java.base/java.io=ALL-UNNAMED",
+      "--add-opens=java.base/java.nio=ALL-UNNAMED",
+      "--add-opens=java.base/java.nio.file=ALL-UNNAMED",
+      "--add-opens=java.base/java.util.concurrent=ALL-UNNAMED",
+      "--add-opens=java.base/java.util.regex=ALL-UNNAMED",
+      "--add-opens=java.base/java.util.stream=ALL-UNNAMED",
+      "--add-opens=java.base/java.text=ALL-UNNAMED",
+      "--add-opens=java.base/java.time=ALL-UNNAMED",
+      "--add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED"
+    )
 
   userMaxForks = project.hasProperty('maxParallelForks') ? maxParallelForks.toInteger() : null
   userIgnoreFailures = project.hasProperty('ignoreFailures') ? ignoreFailures : false
@@ -246,7 +260,8 @@ subprojects {
     options.encoding = 'UTF-8'
     options.compilerArgs << "-Xlint:all"
     // temporary exclusions until all the warnings are fixed
-    options.compilerArgs << "-Xlint:-rawtypes"
+    if (!project.path.startsWith(":connect"))
+      options.compilerArgs << "-Xlint:-rawtypes"
     options.compilerArgs << "-Xlint:-serial"
     options.compilerArgs << "-Xlint:-try"
     options.compilerArgs << "-Werror"
@@ -383,7 +398,7 @@ subprojects {
   // The suites are for running sets of tests in IDEs.
   // Gradle will run each test class, so we exclude the suites to avoid redundantly running the tests twice.
   def testsToExclude = ['**/*Suite.class']
-  // Exclude PowerMock tests when running with Java 16 until a version of PowerMock that supports Java 16 is released
+  // Exclude PowerMock tests when running with Java 16 or newer until a version of PowerMock that supports the relevant versions is released
   // The relevant issues are https://github.com/powermock/powermock/issues/1094 and https://github.com/powermock/powermock/issues/1099
   if (JavaVersion.current().isCompatibleWith(JavaVersion.VERSION_16)) {
     testsToExclude.addAll([
@@ -394,10 +409,9 @@ subprojects {
       "**/KafkaBasedLogTest.*", "**/OffsetStorageWriterTest.*", "**/StandaloneHerderTest.*",
       "**/SourceTaskOffsetCommitterTest.*", "**/WorkerConfigTransformerTest.*", "**/WorkerGroupMemberTest.*",
       "**/WorkerSinkTaskTest.*", "**/WorkerSinkTaskThreadedTest.*", "**/WorkerSourceTaskTest.*",
-      "**/WorkerTaskTest.*", "**/WorkerTest.*", "**/RestServerTest.*",
+      "**/WorkerTaskTest.*", "**/WorkerTest.*",
       // streams tests
-      "**/KafkaStreamsTest.*", "**/RepartitionTopicsTest.*", "**/RocksDBMetricsRecorderTest.*",
-      "**/StreamsMetricsImplTest.*", "**/StateManagerUtilTest.*", "**/TableSourceNodeTest.*"
+      "**/KafkaStreamsTest.*"
     ])
   }
 
@@ -840,6 +854,7 @@ project(':core') {
     implementation libs.jacksonDataformatCsv
     implementation libs.jacksonJDK8Datatypes
     implementation libs.joptSimple
+    implementation libs.jose4j
     implementation libs.metrics
     implementation libs.scalaCollectionCompat
     implementation libs.scalaJava8Compat
@@ -848,6 +863,9 @@ project(':core') {
     implementation libs.scalaLogging
     implementation libs.slf4jApi
     implementation(libs.zookeeper) {
+      // Dropwizard Metrics are required by ZooKeeper as of v3.6.0,
+      // but the library should *not* be used in Kafka code
+      implementation libs.dropwizardMetrics
       exclude module: 'slf4j-log4j12'
       exclude module: 'log4j'
     }
@@ -857,6 +875,8 @@ project(':core') {
     compileOnly libs.log4j
 
     testImplementation project(':clients').sourceSets.test.output
+    testImplementation project(':metadata').sourceSets.test.output
+    testImplementation project(':raft').sourceSets.test.output
     testImplementation libs.bcpkix
     testImplementation libs.mockitoCore
     testImplementation libs.easymock
@@ -1028,7 +1048,7 @@ project(':core') {
     from(project.file("$rootDir/config")) { into "config/" }
     from(project.file("$rootDir/licenses")) { into "licenses/" }
     from "$rootDir/LICENSE-binary" rename {String filename -> filename.replace("-binary", "")}
-    from "$rootDir/NOTICE"
+    from "$rootDir/NOTICE-binary" rename {String filename -> filename.replace("-binary", "")}
     from(configurations.runtimeClasspath) { into("libs/") }
     from(configurations.archives.artifacts.files) { into("libs/") }
     from(project.siteDocsTar) { into("site-docs/") }
@@ -1206,6 +1226,7 @@ project(':clients') {
 
     compileOnly libs.jacksonDatabind // for SASL/OAUTHBEARER bearer token parsing
     compileOnly libs.jacksonJDK8Datatypes
+    compileOnly libs.jose4j          // for SASL/OAUTHBEARER JWT validation; only used by broker
 
     testImplementation libs.bcpkix
     testImplementation libs.junitJupiter
@@ -1214,6 +1235,7 @@ project(':clients') {
     testRuntimeOnly libs.slf4jlog4j
     testRuntimeOnly libs.jacksonDatabind
     testRuntimeOnly libs.jacksonJDK8Datatypes
+    testImplementation libs.jose4j
     testImplementation libs.jacksonJaxrsJsonProvider
   }
 
@@ -1524,8 +1546,11 @@ project(':storage') {
 
     testImplementation project(':clients')
     testImplementation project(':clients').sourceSets.test.output
+    testImplementation project(':core')
+    testImplementation project(':core').sourceSets.test.output
     testImplementation libs.junitJupiter
     testImplementation libs.mockitoCore
+    testImplementation libs.bcpkix
 
     testRuntimeOnly libs.slf4jlog4j
   }
@@ -1580,6 +1605,12 @@ project(':storage') {
     }
   }
 
+  test {
+    useJUnitPlatform {
+      includeEngines 'junit-jupiter'
+    }
+  }
+
   clean.doFirst {
     delete "$buildDir/kafka/"
   }
@@ -1601,6 +1632,7 @@ project(':tools') {
     implementation libs.slf4jApi
     implementation libs.log4j
 
+    implementation libs.jose4j                    // for SASL/OAUTHBEARER JWT validation
     implementation libs.jacksonJaxrsJsonProvider
 
     testImplementation project(':clients')
@@ -1698,6 +1730,7 @@ project(':shell') {
     implementation project(':metadata')
     implementation project(':raft')
 
+    implementation libs.jose4j                    // for SASL/OAUTHBEARER JWT validation
     implementation libs.jacksonJaxrsJsonProvider
 
     testImplementation project(':clients')
@@ -1852,6 +1885,7 @@ project(':streams') {
             ':streams:upgrade-system-tests-25:test',
             ':streams:upgrade-system-tests-26:test',
             ':streams:upgrade-system-tests-27:test',
+            ':streams:upgrade-system-tests-28:test',
             ':streams:examples:test'
     ]
   )
@@ -1908,7 +1942,7 @@ project(':streams:test-utils') {
 
     testImplementation project(':clients').sourceSets.test.output
     testImplementation libs.junitJupiter
-    testImplementation libs.easymock
+    testImplementation libs.mockitoCore
     testImplementation libs.hamcrest
 
     testRuntimeOnly libs.slf4jlog4j
@@ -2151,6 +2185,19 @@ project(':streams:upgrade-system-tests-27') {
   }
 }
 
+project(':streams:upgrade-system-tests-28') {
+  archivesBaseName = "kafka-streams-upgrade-system-tests-28"
+
+  dependencies {
+    testImplementation libs.kafkaStreams_28
+    testRuntimeOnly libs.junitJupiter
+  }
+
+  systemTestLibs {
+    dependsOn testJar
+  }
+}
+
 project(':jmh-benchmarks') {
 
   apply plugin: 'com.github.johnrengelman.shadow'
@@ -2224,7 +2271,7 @@ project(':log4j-appender') {
     testImplementation project(':clients').sourceSets.test.output
     testImplementation libs.junitJupiter
     testImplementation libs.hamcrest
-    testImplementation libs.easymock
+    testImplementation libs.mockitoCore
   }
 
   javadoc {
@@ -2360,6 +2407,7 @@ project(':connect:runtime') {
 
     implementation libs.slf4jApi
     implementation libs.log4j
+    implementation libs.jose4j                    // for SASL/OAUTHBEARER JWT validation
     implementation libs.jacksonAnnotations
     implementation libs.jacksonJaxrsJsonProvider
     implementation libs.jerseyContainerServlet
@@ -2463,6 +2511,7 @@ project(':connect:file') {
 
     testImplementation libs.easymock
     testImplementation libs.junitJupiter
+    testImplementation libs.mockitoInline // supports mocking static methods, final classes, etc.
 
     testRuntimeOnly libs.slf4jlog4j
     testImplementation project(':clients').sourceSets.test.output
@@ -2499,7 +2548,7 @@ project(':connect:basic-auth-extension') {
     implementation libs.jaxrsApi
 
     testImplementation libs.bcpkix
-    testImplementation libs.easymock
+    testImplementation libs.mockitoCore
     testImplementation libs.junitJupiter
     testImplementation project(':clients').sourceSets.test.output
 

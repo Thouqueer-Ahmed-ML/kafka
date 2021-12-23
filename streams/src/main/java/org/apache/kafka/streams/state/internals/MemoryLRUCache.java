@@ -16,11 +16,13 @@
  */
 package org.apache.kafka.streams.state.internals;
 
+import org.apache.kafka.common.serialization.Serializer;
 import org.apache.kafka.common.utils.Bytes;
 import org.apache.kafka.streams.KeyValue;
 import org.apache.kafka.streams.processor.ProcessorContext;
 import org.apache.kafka.streams.processor.StateStore;
 import org.apache.kafka.streams.processor.StateStoreContext;
+import org.apache.kafka.streams.query.Position;
 import org.apache.kafka.streams.state.KeyValueIterator;
 import org.apache.kafka.streams.state.KeyValueStore;
 
@@ -33,6 +35,9 @@ import java.util.Objects;
  * An in-memory LRU cache store based on HashSet and HashMap.
  */
 public class MemoryLRUCache implements KeyValueStore<Bytes, byte[]> {
+
+    protected StateStoreContext context;
+    protected Position position = Position.emptyPosition();
 
     public interface EldestEntryRemovalListener {
         void apply(Bytes key, byte[] value);
@@ -94,6 +99,7 @@ public class MemoryLRUCache implements KeyValueStore<Bytes, byte[]> {
             put(Bytes.wrap(key), value);
             restoring = false;
         });
+        this.context = context;
     }
 
     @Override
@@ -121,6 +127,7 @@ public class MemoryLRUCache implements KeyValueStore<Bytes, byte[]> {
         } else {
             this.map.put(key, value);
         }
+        StoreQueryUtils.updatePosition(position, context);
     }
 
     @Override
@@ -143,6 +150,7 @@ public class MemoryLRUCache implements KeyValueStore<Bytes, byte[]> {
     @Override
     public synchronized byte[] delete(final Bytes key) {
         Objects.requireNonNull(key);
+        StoreQueryUtils.updatePosition(position, context);
         return this.map.remove(key);
     }
 
@@ -176,6 +184,15 @@ public class MemoryLRUCache implements KeyValueStore<Bytes, byte[]> {
     @Override
     public KeyValueIterator<Bytes, byte[]> reverseAll() {
         throw new UnsupportedOperationException("MemoryLRUCache does not support reverseAll() function.");
+    }
+
+    /**
+     * @throws UnsupportedOperationException at every invocation
+     */
+    @Override
+    public <PS extends Serializer<P>, P> KeyValueIterator<Bytes, byte[]> prefixScan(final P prefix,
+                                                                                    final PS prefixKeySerializer) {
+        throw new UnsupportedOperationException("MemoryLRUCache does not support prefixScan() function.");
     }
 
     @Override

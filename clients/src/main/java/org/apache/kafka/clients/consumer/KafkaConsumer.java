@@ -26,6 +26,7 @@ import org.apache.kafka.clients.consumer.internals.ConsumerCoordinator;
 import org.apache.kafka.clients.consumer.internals.ConsumerInterceptors;
 import org.apache.kafka.clients.consumer.internals.ConsumerMetadata;
 import org.apache.kafka.clients.consumer.internals.ConsumerNetworkClient;
+import org.apache.kafka.clients.consumer.internals.Fetch;
 import org.apache.kafka.clients.consumer.internals.Fetcher;
 import org.apache.kafka.clients.consumer.internals.FetcherMetricsRegistry;
 import org.apache.kafka.clients.consumer.internals.KafkaConsumerMetrics;
@@ -221,7 +222,7 @@ import java.util.regex.Pattern;
  * </pre>
  *
  * The connection to the cluster is bootstrapped by specifying a list of one or more brokers to contact using the
- * configuration {@code >bootstrap.servers}. This list is just used to discover the rest of the brokers in the
+ * configuration {@code bootstrap.servers}. This list is just used to discover the rest of the brokers in the
  * cluster and need not be an exhaustive list of servers in the cluster (though you may want to specify more than one in
  * case there are servers down when the client is connecting).
  * <p>
@@ -1175,9 +1176,11 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
      * offset for the subscribed list of partitions
      *
      * <p>
-     * This method returns immediately if there are records available. Otherwise, it will await the passed timeout.
-     * If the timeout expires, an empty record set will be returned. Note that this method may block beyond the
-     * timeout in order to execute custom {@link ConsumerRebalanceListener} callbacks.
+     * This method returns immediately if there are records available or if the position advances past control records
+     * or aborted transactions when isolation.level=read_committed.
+     * Otherwise, it will await the passed timeout. If the timeout expires, an empty record set will be returned.
+     * Note that this method may block beyond the timeout in order to execute custom
+     * {@link ConsumerRebalanceListener} callbacks.
      *
      *
      * @param timeout The maximum time to block (must not be greater than {@link Long#MAX_VALUE} milliseconds)
@@ -1235,8 +1238,8 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
                     }
                 }
 
-                final Map<TopicPartition, List<ConsumerRecord<K, V>>> records = pollForFetches(timer);
-                if (!records.isEmpty()) {
+                final Fetch<K, V> fetch = pollForFetches(timer);
+                if (!fetch.isEmpty()) {
                     // before returning the fetched records, we can send off the next round of fetches
                     // and avoid block waiting for their responses to enable pipelining while the user
                     // is handling the fetched records.
@@ -1247,7 +1250,12 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
                         client.transmitSends();
                     }
 
-                    return this.interceptors.onConsume(new ConsumerRecords<>(records));
+                    if (fetch.records().isEmpty()) {
+                        log.trace("Returning empty records from `poll()` "
+                                + "since the consumer's position has advanced for at least one topic partition");
+                    }
+
+                    return this.interceptors.onConsume(new ConsumerRecords<>(fetch.records()));
                 }
             } while (timer.notExpired());
 
@@ -1269,14 +1277,14 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
     /**
      * @throws KafkaException if the rebalance callback throws exception
      */
-    private Map<TopicPartition, List<ConsumerRecord<K, V>>> pollForFetches(Timer timer) {
+    private Fetch<K, V> pollForFetches(Timer timer) {
         long pollTimeout = coordinator == null ? timer.remainingMs() :
                 Math.min(coordinator.timeToNextPoll(timer.currentTimeMs()), timer.remainingMs());
 
         // if data is available already, return it immediately
-        final Map<TopicPartition, List<ConsumerRecord<K, V>>> records = fetcher.fetchedRecords();
-        if (!records.isEmpty()) {
-            return records;
+        final Fetch<K, V> fetch = fetcher.collectFetch();
+        if (!fetch.isEmpty()) {
+            return fetch;
         }
 
         // send any new fetches (won't resend pending fetches)
@@ -1301,7 +1309,7 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
         });
         timer.update(pollTimer.currentTimeMs());
 
-        return fetcher.fetchedRecords();
+        return fetcher.collectFetch();
     }
 
     /**
@@ -1485,6 +1493,7 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
     @Override
     public void commitSync(final Map<TopicPartition, OffsetAndMetadata> offsets, final Duration timeout) {
         acquireAndEnsureOpen();
+        long commitStart = time.nanoseconds();
         try {
             maybeThrowInvalidGroupIdException();
             offsets.forEach(this::updateLastSeenEpochIfNewer);
@@ -1493,6 +1502,7 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
                         "committing offsets " + offsets);
             }
         } finally {
+            kafkaConsumerMetrics.recordCommitSync(time.nanoseconds() - commitStart);
             release();
         }
     }
@@ -1871,9 +1881,11 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
     @Override
     public Map<TopicPartition, OffsetAndMetadata> committed(final Set<TopicPartition> partitions, final Duration timeout) {
         acquireAndEnsureOpen();
+        long start = time.nanoseconds();
         try {
             maybeThrowInvalidGroupIdException();
-            Map<TopicPartition, OffsetAndMetadata> offsets = coordinator.fetchCommittedOffsets(partitions, time.timer(timeout));
+            final Map<TopicPartition, OffsetAndMetadata> offsets;
+            offsets = coordinator.fetchCommittedOffsets(partitions, time.timer(timeout));
             if (offsets == null) {
                 throw new TimeoutException("Timeout of " + timeout.toMillis() + "ms expired before the last " +
                     "committed offset for partitions " + partitions + " could be determined. Try tuning default.api.timeout.ms " +
@@ -1883,6 +1895,7 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
                 return offsets;
             }
         } finally {
+            kafkaConsumerMetrics.recordCommitted(time.nanoseconds() - start);
             release();
         }
     }
@@ -2237,7 +2250,24 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
         acquireAndEnsureOpen();
         try {
             final Long lag = subscriptions.partitionLag(topicPartition, isolationLevel);
-            return lag == null ? OptionalLong.empty() : OptionalLong.of(lag);
+
+            // if the log end offset is not known and hence cannot return lag and there is
+            // no in-flight list offset requested yet,
+            // issue a list offset request for that partition so that next time
+            // we may get the answer; we do not need to wait for the return value
+            // since we would not try to poll the network client synchronously
+            if (lag == null) {
+                if (subscriptions.partitionEndOffset(topicPartition, isolationLevel) == null &&
+                    !subscriptions.partitionEndOffsetRequested(topicPartition)) {
+                    log.info("Requesting the log end offset for {} in order to compute lag", topicPartition);
+                    subscriptions.requestPartitionEndOffset(topicPartition);
+                    fetcher.endOffsets(Collections.singleton(topicPartition), time.timer(0L));
+                }
+
+                return OptionalLong.empty();
+            }
+
+            return OptionalLong.of(lag);
         } finally {
             release();
         }

@@ -51,6 +51,7 @@ import scala.jdk.CollectionConverters._
 /**
  * Test suite that verifies that the topology built by the Java and Scala APIs match.
  */
+//noinspection ScalaDeprecation
 class TopologyTest {
 
   private val inputTopic = "input-topic"
@@ -286,13 +287,12 @@ class TopologyTest {
       val textLines = streamBuilder.stream[String, String](inputTopic)
 
       val _: KTable[String, Long] = textLines
-        .transform(
-          () =>
-            new Transformer[String, String, KeyValue[String, String]] {
-              override def init(context: ProcessorContext): Unit = ()
-              override def transform(key: String, value: String): KeyValue[String, String] =
-                new KeyValue(key, value.toLowerCase)
-              override def close(): Unit = ()
+        .transform(() =>
+          new Transformer[String, String, KeyValue[String, String]] {
+            override def init(context: ProcessorContext): Unit = ()
+            override def transform(key: String, value: String): KeyValue[String, String] =
+              new KeyValue(key, value.toLowerCase)
+            override def close(): Unit = ()
           }
         )
         .groupBy((_, v) => v)
@@ -307,13 +307,12 @@ class TopologyTest {
       val streamBuilder = new StreamsBuilderJ
       val textLines: KStreamJ[String, String] = streamBuilder.stream[String, String](inputTopic)
 
-      val lowered: KStreamJ[String, String] = textLines.transform(
-        () =>
-          new Transformer[String, String, KeyValue[String, String]] {
-            override def init(context: ProcessorContext): Unit = ()
-            override def transform(key: String, value: String): KeyValue[String, String] =
-              new KeyValue(key, value.toLowerCase)
-            override def close(): Unit = ()
+      val lowered: KStreamJ[String, String] = textLines.transform(() =>
+        new Transformer[String, String, KeyValue[String, String]] {
+          override def init(context: ProcessorContext): Unit = ()
+          override def transform(key: String, value: String): KeyValue[String, String] =
+            new KeyValue(key, value.toLowerCase)
+          override def close(): Unit = ()
         }
       )
 
@@ -377,14 +376,20 @@ class TopologyTest {
 
       mappedStream
         .filter((k: String, _: String) => k == "A")
-        .join(stream2)((v1: String, v2: Int) => v1 + ":" + v2.toString, JoinWindows.of(Duration.ofMillis(5000)))(
+        .join(stream2)(
+          (v1: String, v2: Int) => v1 + ":" + v2.toString,
+          JoinWindows.ofTimeDifferenceAndGrace(Duration.ofMillis(5000), Duration.ofHours(24))
+        )(
           StreamJoined.`with`(NewSerdes.stringSerde, NewSerdes.stringSerde, NewSerdes.intSerde)
         )
         .to(JOINED_TOPIC)
 
       mappedStream
         .filter((k: String, _: String) => k == "A")
-        .join(stream3)((v1: String, v2: String) => v1 + ":" + v2.toString, JoinWindows.of(Duration.ofMillis(5000)))(
+        .join(stream3)(
+          (v1: String, v2: String) => v1 + ":" + v2.toString,
+          JoinWindows.ofTimeDifferenceAndGrace(Duration.ofMillis(5000), Duration.ofHours(24))
+        )(
           StreamJoined.`with`(NewSerdes.stringSerde, NewSerdes.stringSerde, NewSerdes.stringSerde)
         )
         .to(JOINED_TOPIC)
@@ -433,27 +438,35 @@ class TopologyTest {
 
       mappedStream
         .filter((key, _) => key == "A")
-        .join[Integer, String](stream2,
-                               valueJoiner2,
-                               JoinWindows.of(Duration.ofMillis(5000)),
-                               StreamJoinedJ.`with`(NewSerdes.stringSerde, NewSerdes.stringSerde, SerdesJ.Integer))
+        .join[Integer, String](
+          stream2,
+          valueJoiner2,
+          JoinWindows.ofTimeDifferenceAndGrace(Duration.ofMillis(5000), Duration.ofHours(24)),
+          StreamJoinedJ.`with`(NewSerdes.stringSerde, NewSerdes.stringSerde, SerdesJ.Integer)
+        )
         .to(JOINED_TOPIC)
 
       mappedStream
         .filter((key, _) => key == "A")
-        .join(stream3,
-              valueJoiner3,
-              JoinWindows.of(Duration.ofMillis(5000)),
-              StreamJoinedJ.`with`(NewSerdes.stringSerde, NewSerdes.stringSerde, SerdesJ.String))
+        .join(
+          stream3,
+          valueJoiner3,
+          JoinWindows.ofTimeDifferenceAndGrace(Duration.ofMillis(5000), Duration.ofHours(24)),
+          StreamJoinedJ.`with`(NewSerdes.stringSerde, NewSerdes.stringSerde, SerdesJ.String)
+        )
         .to(JOINED_TOPIC)
 
       builder
     }
 
-    assertNotEquals(getTopologyScala.build(props).describe.toString,
-                    getTopologyScala.build(propsNoOptimization).describe.toString)
-    assertEquals(getTopologyScala.build(propsNoOptimization).describe.toString,
-                 getTopologyJava.build(propsNoOptimization).describe.toString)
+    assertNotEquals(
+      getTopologyScala.build(props).describe.toString,
+      getTopologyScala.build(propsNoOptimization).describe.toString
+    )
+    assertEquals(
+      getTopologyScala.build(propsNoOptimization).describe.toString,
+      getTopologyJava.build(propsNoOptimization).describe.toString
+    )
     assertEquals(getTopologyScala.build(props).describe.toString, getTopologyJava.build(props).describe.toString)
   }
 

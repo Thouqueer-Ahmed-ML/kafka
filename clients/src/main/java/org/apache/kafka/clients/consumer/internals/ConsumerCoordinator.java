@@ -81,6 +81,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
+import static org.apache.kafka.clients.consumer.ConsumerConfig.ASSIGN_FROM_SUBSCRIBED_ASSIGNORS;
+import static org.apache.kafka.clients.consumer.CooperativeStickyAssignor.COOPERATIVE_STICKY_ASSIGNOR_NAME;
+
 /**
  * This class manages the coordination process with the consumer coordinator.
  */
@@ -556,6 +559,53 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
         maybeUpdateSubscriptionMetadata();
     }
 
+    private boolean isAssignFromSubscribedTopicsAssignor(String name) {
+        return ASSIGN_FROM_SUBSCRIBED_ASSIGNORS.contains(name);
+    }
+
+    /**
+     * user-customized assignor may have created some topics that are not in the subscription list
+     * and assign their partitions to the members; in this case we would like to update the leader's
+     * own metadata with the newly added topics so that it will not trigger a subsequent rebalance
+     * when these topics gets updated from metadata refresh.
+     *
+     * We skip the check for in-product assignors since this will not happen in in-product assignors.
+     *
+     * TODO: this is a hack and not something we want to support long-term unless we push regex into the protocol
+     *       we may need to modify the ConsumerPartitionAssignor API to better support this case.
+     *
+     * @param assignorName          the selected assignor name
+     * @param assignments           the assignments after assignor assigned
+     * @param allSubscribedTopics   all consumers' subscribed topics
+     */
+    private void maybeUpdateGroupSubscription(String assignorName,
+                                              Map<String, Assignment> assignments,
+                                              Set<String> allSubscribedTopics) {
+        if (!isAssignFromSubscribedTopicsAssignor(assignorName)) {
+            Set<String> assignedTopics = new HashSet<>();
+            for (Assignment assigned : assignments.values()) {
+                for (TopicPartition tp : assigned.partitions())
+                    assignedTopics.add(tp.topic());
+            }
+
+            if (!assignedTopics.containsAll(allSubscribedTopics)) {
+                Set<String> notAssignedTopics = new HashSet<>(allSubscribedTopics);
+                notAssignedTopics.removeAll(assignedTopics);
+                log.warn("The following subscribed topics are not assigned to any members: {} ", notAssignedTopics);
+            }
+
+            if (!allSubscribedTopics.containsAll(assignedTopics)) {
+                Set<String> newlyAddedTopics = new HashSet<>(assignedTopics);
+                newlyAddedTopics.removeAll(allSubscribedTopics);
+                log.info("The following not-subscribed topics are assigned, and their metadata will be " +
+                    "fetched from the brokers: {}", newlyAddedTopics);
+
+                allSubscribedTopics.addAll(newlyAddedTopics);
+                updateGroupSubscription(allSubscribedTopics);
+            }
+        }
+    }
+
     @Override
     protected Map<String, ByteBuffer> performAssignment(String leaderId,
                                                         String assignmentStrategy,
@@ -563,6 +613,7 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
         ConsumerPartitionAssignor assignor = lookupAssignor(assignmentStrategy);
         if (assignor == null)
             throw new IllegalStateException("Coordinator selected invalid assignment protocol: " + assignmentStrategy);
+        String assignorName = assignor.name();
 
         Set<String> allSubscribedTopics = new HashSet<>();
         Map<String, Subscription> subscriptions = new HashMap<>();
@@ -584,42 +635,17 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
 
         isLeader = true;
 
-        log.debug("Performing assignment using strategy {} with subscriptions {}", assignor.name(), subscriptions);
+        log.debug("Performing assignment using strategy {} with subscriptions {}", assignorName, subscriptions);
 
         Map<String, Assignment> assignments = assignor.assign(metadata.fetch(), new GroupSubscription(subscriptions)).groupAssignment();
 
-        if (protocol == RebalanceProtocol.COOPERATIVE) {
+        // skip the validation for built-in cooperative sticky assignor since we've considered
+        // the "generation" of ownedPartition inside the assignor
+        if (protocol == RebalanceProtocol.COOPERATIVE && !assignorName.equals(COOPERATIVE_STICKY_ASSIGNOR_NAME)) {
             validateCooperativeAssignment(ownedPartitions, assignments);
         }
 
-        // user-customized assignor may have created some topics that are not in the subscription list
-        // and assign their partitions to the members; in this case we would like to update the leader's
-        // own metadata with the newly added topics so that it will not trigger a subsequent rebalance
-        // when these topics gets updated from metadata refresh.
-        //
-        // TODO: this is a hack and not something we want to support long-term unless we push regex into the protocol
-        //       we may need to modify the ConsumerPartitionAssignor API to better support this case.
-        Set<String> assignedTopics = new HashSet<>();
-        for (Assignment assigned : assignments.values()) {
-            for (TopicPartition tp : assigned.partitions())
-                assignedTopics.add(tp.topic());
-        }
-
-        if (!assignedTopics.containsAll(allSubscribedTopics)) {
-            Set<String> notAssignedTopics = new HashSet<>(allSubscribedTopics);
-            notAssignedTopics.removeAll(assignedTopics);
-            log.warn("The following subscribed topics are not assigned to any members: {} ", notAssignedTopics);
-        }
-
-        if (!allSubscribedTopics.containsAll(assignedTopics)) {
-            Set<String> newlyAddedTopics = new HashSet<>(assignedTopics);
-            newlyAddedTopics.removeAll(allSubscribedTopics);
-            log.info("The following not-subscribed topics are assigned, and their metadata will be " +
-                    "fetched from the brokers: {}", newlyAddedTopics);
-
-            allSubscribedTopics.addAll(assignedTopics);
-            updateGroupSubscription(allSubscribedTopics);
-        }
+        maybeUpdateGroupSubscription(assignorName, assignments, allSubscribedTopics);
 
         assignmentSnapshot = metadataSnapshot;
 
@@ -683,13 +709,13 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
         // so that users can still access the previously owned partitions to commit offsets etc.
         Exception exception = null;
         final Set<TopicPartition> revokedPartitions;
-        if (generation == Generation.NO_GENERATION.generationId &&
+        if (generation == Generation.NO_GENERATION.generationId ||
             memberId.equals(Generation.NO_GENERATION.memberId)) {
             revokedPartitions = new HashSet<>(subscriptions.assignedPartitions());
 
             if (!revokedPartitions.isEmpty()) {
-                log.info("Giving away all assigned partitions as lost since generation has been reset," +
-                    "indicating that consumer is no longer part of the group");
+                log.info("Giving away all assigned partitions as lost since generation/memberID has been reset," +
+                    "indicating that consumer is in old state or no longer part of the group");
                 exception = invokePartitionsLost(revokedPartitions);
 
                 subscriptions.assignFromSubscribed(Collections.emptySet());
@@ -733,18 +759,19 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
 
     @Override
     public void onLeavePrepare() {
-        // Save the current Generation and use that to get the memberId, as the hb thread can change it at any time
+        // Save the current Generation, as the hb thread can change it at any time
         final Generation currentGeneration = generation();
-        final String memberId = currentGeneration.memberId;
 
-        log.debug("Executing onLeavePrepare with generation {} and memberId {}", currentGeneration, memberId);
+        log.debug("Executing onLeavePrepare with generation {}", currentGeneration);
 
         // we should reset assignment and trigger the callback before leaving group
         Set<TopicPartition> droppedPartitions = new HashSet<>(subscriptions.assignedPartitions());
 
         if (subscriptions.hasAutoAssignedPartitions() && !droppedPartitions.isEmpty()) {
             final Exception e;
-            if (generation() == Generation.NO_GENERATION || rebalanceInProgress()) {
+            if ((currentGeneration.generationId == Generation.NO_GENERATION.generationId ||
+                currentGeneration.memberId.equals(Generation.NO_GENERATION.memberId)) ||
+                rebalanceInProgress()) {
                 e = invokePartitionsLost(droppedPartitions);
             } else {
                 e = invokePartitionsRevoked(droppedPartitions);
@@ -771,7 +798,7 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
         if (assignmentSnapshot != null && !assignmentSnapshot.matches(metadataSnapshot)) {
             final String reason = String.format("cached metadata has changed from %s at the beginning of the rebalance to %s",
                 assignmentSnapshot, metadataSnapshot);
-            requestRejoin(reason);
+            requestRejoinIfNecessary(reason);
             return true;
         }
 
@@ -779,7 +806,7 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
         if (joinedSubscription != null && !joinedSubscription.equals(subscriptions.subscription())) {
             final String reason = String.format("subscription has changed from %s at the beginning of the rebalance to %s",
                 joinedSubscription, subscriptions.subscription());
-            requestRejoin(reason);
+            requestRejoinIfNecessary(reason);
             return true;
         }
 
@@ -1256,7 +1283,8 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
                                         "consumer member's generation is already stale, meaning it has already participated another rebalance and " +
                                         "got a new generation. You can try completing the rebalance by calling poll() and then retry commit again");
                                 } else {
-                                    resetGenerationOnResponseError(ApiKeys.OFFSET_COMMIT, error);
+                                    // don't reset generation member ID when ILLEGAL_GENERATION, since the member might be still valid
+                                    resetStateOnResponseError(ApiKeys.OFFSET_COMMIT, error, error != Errors.ILLEGAL_GENERATION);
                                     exception = new CommitFailedException();
                                 }
                             }
@@ -1308,29 +1336,31 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
 
         @Override
         public void handle(OffsetFetchResponse response, RequestFuture<Map<TopicPartition, OffsetAndMetadata>> future) {
-            if (response.hasError()) {
-                Errors error = response.error();
-                log.debug("Offset fetch failed: {}", error.message());
+            Errors responseError = response.groupLevelError(rebalanceConfig.groupId);
+            if (responseError != Errors.NONE) {
+                log.debug("Offset fetch failed: {}", responseError.message());
 
-                if (error == Errors.COORDINATOR_LOAD_IN_PROGRESS) {
+                if (responseError == Errors.COORDINATOR_LOAD_IN_PROGRESS) {
                     // just retry
-                    future.raise(error);
-                } else if (error == Errors.NOT_COORDINATOR) {
+                    future.raise(responseError);
+                } else if (responseError == Errors.NOT_COORDINATOR) {
                     // re-discover the coordinator and retry
-                    markCoordinatorUnknown(error);
-                    future.raise(error);
-                } else if (error == Errors.GROUP_AUTHORIZATION_FAILED) {
+                    markCoordinatorUnknown(responseError);
+                    future.raise(responseError);
+                } else if (responseError == Errors.GROUP_AUTHORIZATION_FAILED) {
                     future.raise(GroupAuthorizationException.forGroupId(rebalanceConfig.groupId));
                 } else {
-                    future.raise(new KafkaException("Unexpected error in fetch offset response: " + error.message()));
+                    future.raise(new KafkaException("Unexpected error in fetch offset response: " + responseError.message()));
                 }
                 return;
             }
 
             Set<String> unauthorizedTopics = null;
-            Map<TopicPartition, OffsetAndMetadata> offsets = new HashMap<>(response.responseData().size());
+            Map<TopicPartition, OffsetFetchResponse.PartitionData> responseData =
+                response.partitionDataMap(rebalanceConfig.groupId);
+            Map<TopicPartition, OffsetAndMetadata> offsets = new HashMap<>(responseData.size());
             Set<TopicPartition> unstableTxnOffsetTopicPartitions = new HashSet<>();
-            for (Map.Entry<TopicPartition, OffsetFetchResponse.PartitionData> entry : response.responseData().entrySet()) {
+            for (Map.Entry<TopicPartition, OffsetFetchResponse.PartitionData> entry : responseData.entrySet()) {
                 TopicPartition tp = entry.getKey();
                 OffsetFetchResponse.PartitionData partitionData = entry.getValue();
                 if (partitionData.hasError()) {

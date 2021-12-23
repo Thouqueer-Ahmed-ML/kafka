@@ -35,9 +35,10 @@ import kafka.log.LogConfig
 import kafka.message.ProducerCompressionCodec
 import kafka.metrics.KafkaYammerMetrics
 import kafka.network.{Processor, RequestChannel}
+import kafka.server.QuorumTestHarness
 import kafka.utils._
 import kafka.utils.Implicits._
-import kafka.zk.{ConfigEntityChangeNotificationZNode, ZooKeeperTestHarness}
+import kafka.zk.{ConfigEntityChangeNotificationZNode}
 import org.apache.kafka.clients.CommonClientConfigs
 import org.apache.kafka.clients.admin.AlterConfigOp.OpType
 import org.apache.kafka.clients.admin.ConfigEntry.{ConfigSource, ConfigSynonym}
@@ -61,7 +62,7 @@ import org.apache.kafka.common.security.scram.ScramCredential
 import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
 import org.apache.kafka.test.{TestSslUtils, TestUtils => JTestUtils}
 import org.junit.jupiter.api.Assertions._
-import org.junit.jupiter.api.{AfterEach, BeforeEach, Disabled, Test}
+import org.junit.jupiter.api.{AfterEach, BeforeEach, Disabled, Test, TestInfo}
 
 import scala.annotation.nowarn
 import scala.collection._
@@ -74,7 +75,7 @@ object DynamicBrokerReconfigurationTest {
   val SecureExternal = "EXTERNAL"
 }
 
-class DynamicBrokerReconfigurationTest extends ZooKeeperTestHarness with SaslSetup {
+class DynamicBrokerReconfigurationTest extends QuorumTestHarness with SaslSetup {
 
   import DynamicBrokerReconfigurationTest._
 
@@ -101,9 +102,9 @@ class DynamicBrokerReconfigurationTest extends ZooKeeperTestHarness with SaslSet
   }
 
   @BeforeEach
-  override def setUp(): Unit = {
+  override def setUp(testInfo: TestInfo): Unit = {
     startSasl(jaasSections(kafkaServerSaslMechanisms, Some(kafkaClientSaslMechanism)))
-    super.setUp()
+    super.setUp(testInfo)
 
     clearLeftOverProcessorMetrics() // clear metrics left over from other tests so that new ones can be tested
 
@@ -675,7 +676,7 @@ class DynamicBrokerReconfigurationTest extends ZooKeeperTestHarness with SaslSet
     consumer.commitSync()
 
     def partitionInfo: TopicPartitionInfo =
-      adminClients.head.describeTopics(Collections.singleton(topic)).values.get(topic).get().partitions().get(0)
+      adminClients.head.describeTopics(Collections.singleton(topic)).topicNameValues().get(topic).get().partitions().get(0)
 
     val partitionInfo0 = partitionInfo
     assertEquals(partitionInfo0.replicas.get(0), partitionInfo0.leader)
@@ -1094,7 +1095,7 @@ class DynamicBrokerReconfigurationTest extends ZooKeeperTestHarness with SaslSet
     val listeners = config.listeners
       .map(e => s"${e.listenerName.value}://${e.host}:${e.port}")
       .mkString(",") + s",$listenerName://localhost:0"
-    val listenerMap = config.listenerSecurityProtocolMap
+    val listenerMap = config.effectiveListenerSecurityProtocolMap
       .map { case (name, protocol) => s"${name.value}:${protocol.name}" }
       .mkString(",") + s",$listenerName:${securityProtocol.name}"
 
@@ -1173,7 +1174,7 @@ class DynamicBrokerReconfigurationTest extends ZooKeeperTestHarness with SaslSet
       .filter(e => e.listenerName.value != securityProtocol.name)
       .map(e => s"${e.listenerName.value}://${e.host}:${e.port}")
       .mkString(",")
-    val listenerMap = config.listenerSecurityProtocolMap
+    val listenerMap = config.effectiveListenerSecurityProtocolMap
       .filter { case (listenerName, _) => listenerName.value != securityProtocol.name }
       .map { case (listenerName, protocol) => s"${listenerName.value}:${protocol.name}" }
       .mkString(",")
@@ -1363,7 +1364,7 @@ class DynamicBrokerReconfigurationTest extends ZooKeeperTestHarness with SaslSet
   private def alterAdvertisedListener(adminClient: Admin, externalAdminClient: Admin, oldHost: String, newHost: String): Unit = {
     val configs = servers.map { server =>
       val resource = new ConfigResource(ConfigResource.Type.BROKER, server.config.brokerId.toString)
-      val newListeners = server.config.advertisedListeners.map { e =>
+      val newListeners = server.config.effectiveAdvertisedListeners.map { e =>
         if (e.listenerName.value == SecureExternal)
           s"${e.listenerName.value}://$newHost:${server.boundPort(e.listenerName)}"
         else
@@ -1375,7 +1376,7 @@ class DynamicBrokerReconfigurationTest extends ZooKeeperTestHarness with SaslSet
     adminClient.alterConfigs(configs).all.get
     servers.foreach { server =>
       TestUtils.retry(10000) {
-        val externalListener = server.config.advertisedListeners.find(_.listenerName.value == SecureExternal)
+        val externalListener = server.config.effectiveAdvertisedListeners.find(_.listenerName.value == SecureExternal)
           .getOrElse(throw new IllegalStateException("External listener not found"))
         assertEquals(newHost, externalListener.host, "Config not updated")
       }

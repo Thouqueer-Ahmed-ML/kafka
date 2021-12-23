@@ -325,7 +325,7 @@ class ClientQuotaManager(private val config: ClientQuotaManagerConfig,
    *
    * @param request client request
    * @param throttleTimeMs Duration in milliseconds for which the channel is to be muted.
-   * @param channelThrottlingCallback Callback for channel throttling
+   * @param throttleCallback Callback for channel throttling
    */
   def throttle(
     request: RequestChannel.Request,
@@ -668,7 +668,6 @@ class ClientQuotaManager(private val config: ClientQuotaManagerConfig,
                     if (!overriddenQuotas.containsKey(DefaultUserQuotaEntity)) {
                       // 7) /config/clients/<client-id>
                       // 8) /config/clients/<default>
-                      // 9) static client-id quota
                       metricTags = ("", clientId)
                     }
                   }

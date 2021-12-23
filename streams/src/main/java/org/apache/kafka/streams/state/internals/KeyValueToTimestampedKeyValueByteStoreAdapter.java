@@ -16,11 +16,15 @@
  */
 package org.apache.kafka.streams.state.internals;
 
+import org.apache.kafka.common.serialization.Serializer;
 import org.apache.kafka.common.utils.Bytes;
 import org.apache.kafka.streams.KeyValue;
 import org.apache.kafka.streams.processor.ProcessorContext;
 import org.apache.kafka.streams.processor.StateStore;
 import org.apache.kafka.streams.processor.StateStoreContext;
+import org.apache.kafka.streams.query.PositionBound;
+import org.apache.kafka.streams.query.Query;
+import org.apache.kafka.streams.query.QueryResult;
 import org.apache.kafka.streams.state.KeyValueBytesStoreSupplier;
 import org.apache.kafka.streams.state.KeyValueIterator;
 import org.apache.kafka.streams.state.KeyValueStore;
@@ -115,6 +119,24 @@ public class KeyValueToTimestampedKeyValueByteStoreAdapter implements KeyValueSt
     }
 
     @Override
+    public <R> QueryResult<R> query(
+        final Query<R> query,
+        final PositionBound positionBound,
+        final boolean collectExecutionInfo) {
+
+
+        final long start = collectExecutionInfo ? System.nanoTime() : -1L;
+        final QueryResult<R> result = store.query(query, positionBound, collectExecutionInfo);
+        if (collectExecutionInfo) {
+            final long end = System.nanoTime();
+            result.addExecutionInfo(
+                "Handled in " + getClass() + " in " + (end - start) + "ns"
+            );
+        }
+        return result;
+    }
+
+    @Override
     public byte[] get(final Bytes key) {
         return convertToTimestampedFormat(store.get(key));
     }
@@ -139,6 +161,12 @@ public class KeyValueToTimestampedKeyValueByteStoreAdapter implements KeyValueSt
     @Override
     public KeyValueIterator<Bytes, byte[]> reverseAll() {
         return new KeyValueToTimestampedKeyValueIteratorAdapter<>(store.reverseAll());
+    }
+
+    @Override
+    public <PS extends Serializer<P>, P> KeyValueIterator<Bytes, byte[]> prefixScan(final P prefix,
+                                                                                    final PS prefixKeySerializer) {
+        return new KeyValueToTimestampedKeyValueIteratorAdapter<>(store.prefixScan(prefix, prefixKeySerializer));
     }
 
     @Override

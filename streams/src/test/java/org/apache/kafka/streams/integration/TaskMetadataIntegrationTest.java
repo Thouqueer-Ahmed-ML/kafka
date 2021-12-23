@@ -45,6 +45,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Properties;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
 import static org.apache.kafka.common.utils.Utils.mkEntry;
@@ -77,7 +78,8 @@ public class TaskMetadataIntegrationTest {
     private String inputTopic;
     private static StreamsBuilder builder;
     private static Properties properties;
-    private static String appId = "TaskMetadataTest_";
+    private static String appIdPrefix = "TaskMetadataTest_";
+    private static String appId;
     private AtomicBoolean process;
     private AtomicBoolean commit;
 
@@ -85,7 +87,7 @@ public class TaskMetadataIntegrationTest {
     @Before
     public void setup() {
         final String testId = safeUniqueTestName(getClass(), testName);
-        appId = appId + testId;
+        appId = appIdPrefix + testId;
         inputTopic = "input" + testId;
         IntegrationTestUtils.cleanStateBeforeTest(CLUSTER, inputTopic);
 
@@ -157,10 +159,13 @@ public class TaskMetadataIntegrationTest {
         }
     }
 
-    private TaskMetadata getTaskMetadata(final KafkaStreams kafkaStreams) {
-        final List<TaskMetadata> taskMetadataList = kafkaStreams.metadataForLocalThreads().stream().flatMap(t -> t.activeTasks().stream()).collect(Collectors.toList());
-        assertThat("only one task", taskMetadataList.size() == 1);
-        return taskMetadataList.get(0);
+    private TaskMetadata getTaskMetadata(final KafkaStreams kafkaStreams) throws InterruptedException {
+        final AtomicReference<List<TaskMetadata>> taskMetadataList = new AtomicReference<>();
+        TestUtils.waitForCondition(() -> {
+            taskMetadataList.set(kafkaStreams.metadataForLocalThreads().stream().flatMap(t -> t.activeTasks().stream()).collect(Collectors.toList()));
+            return taskMetadataList.get().size() == 1;
+        }, "The number of active tasks returned in the allotted time was not one.");
+        return taskMetadataList.get().get(0);
     }
 
     @After
